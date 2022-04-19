@@ -1,0 +1,415 @@
+* Hierarchical configuration with ~hydra~
+#+PROPERTY: header-args:bash :session *conf* :eval never-export :exports both :results code
+#+PROPERTY: header-args:python :eval never-export :exports both :results output code
+
+#+begin_src elisp :exports none
+(setq org-confirm-babel-evaluate nil)
+
+(add-hook 'after-save-hook 'org-babel-tangle)
+#+end_src
+
+#+RESULTS:
+| org-babel-tangle | rmail-after-save-hook |
+
+I did some additional research into [[https://hydra.cc/docs/tutorials/basic/running_your_app/working_directory/][~hydra~]]. This is a configuration system,
+created at Facebook A.I. Research. That is also where ~torch~ and [[https://www.pytorchlightning.ai/][Pytorch
+Lightning]] come from, and it fits together nicely.
+
+We use this system already for defining pretty much everything in our training
+pipeline;
+
+- Which model to use
+- Which data to use
+  - Where it is, what dataset type to use
+  - Data augmentations (using [[https://github.com/albumentations-team/albumentations][~albumentations~]])
+- How to configure the training, including ~batch_size~, acceleration strategies
+
+There are many advantages to this system and it is also used for the new cloud
+training scripts.
+
+With the new cloud training, we need to clean up a bit our configuration system.
+Our training runs were reproducible, but the options are split over [[https://github.com/SpotrAI/woco-model-training/blob/bb733ec215c8ca8539b231e36d123d11c3c80381/dvc.yaml][~dvc.yaml~]]
+and the folders in [[https://github.com/SpotrAI/woco-model-training/tree/bb733ec215c8ca8539b231e36d123d11c3c80381/womt/conf][~womt/conf~]]. Below you find an example of how we can organize
+the configuration for each model separately, without copy/pasting.
+
+In addition, some ~hydra~ tricks are shown for variable interpolation and class
+instantiation.
+
+In addition, I have some snippets that show how you can quickly start
+multiple configurations and how you can define experiments.
+
+I'll start reorganising the configuration in ~woco-model-training~ along these
+lines.
+
+** Directory structure
+
+With all examples in the code below, the final directory structure looks like this. 
+
+#+begin_src bash
+tree -I "multirun|outputs|__pycache__"
+#+end_src
+
+#+RESULTS:
+#+begin_src bash
+.
+├── conf
+│   ├── experiment
+│   │   ├── biggpu.yaml
+│   │   └── cropbigbatch.yaml
+│   ├── model
+│   │   ├── base
+│   │   │   └── segmentation.yaml
+│   │   ├── ils-roof-materials.yaml
+│   │   └── ils-streetview-materials.yaml
+│   ├── trainer
+│   │   └── gpu.yaml
+│   └── train.yaml
+├── conf.html
+├── conf.org
+├── defaults.py
+└── instantiate.py
+
+5 directories, 11 files
+#+end_src
+
+I am ommitting the folders ~output~ and ~multirun~. These are created as logging
+folders by ~hydra~, see [[https://hydra.cc/docs/tutorials/basic/running_your_app/working_directory/][documentation]].
+
+** Basic setup
+
+Configuration is described in ~yaml~ files. You can reuse variables with
+interpolation, like ~${base}~ below.
+
+In this example, this is ~conf/train.yaml~, another trick is used with a
+~defaults~ section. This setup means that ~model~ defaults to
+~ils-roof-materials~, the settings for which can be found in ~model/ils-roof-materials~.
+
+#+begin_src yaml :tangle conf/train.yaml
+defaults:
+  - model: ils-roof-materials
+  - trainer: gpu
+  - _self_
+base: ./data
+message: hello at ${base}
+
+#+end_src
+
+** Trainer definition and instantiation with ~hydra~ 
+
+In defaults, we set the default trainer to ~gpu~, which corresponds to what is
+in the file ~conf/trainer/gpu.yaml~.
+
+#+begin_src yaml :tangle conf/trainer/gpu.yaml
+_target_: pytorch_lightning.Trainer
+accelerator: gpu
+max_epochs: 1
+#+end_src
+
+This also shows how you can instantiate things with hydra. If you have something
+with a ~target~ in your configuration, and you call ~hydra.utils.instantiate~ on
+it, ~hydra~ will attempt to find a class (or function) and call it with the
+supplied arguments.
+
+#+begin_src python :tangle instantiate.py
+  import hydra
+  import logging
+  from omegaconf import DictConfig
+
+  logger = logging.getLogger(__name__)
+  
+  @hydra.main(config_path="conf", config_name="train")
+  def main(cfg : DictConfig) -> None:
+    trainer=hydra.utils.instantiate(cfg.trainer)
+    logger.info(f"trainer - {trainer}")
+    logger.info(f"type - {type(trainer)}")
+    logger.info("bye")
+
+  if __name__ == "__main__":
+      main()
+#+end_src
+
+#+RESULTS:
+#+begin_src python
+[2022-04-19 15:45:43,331][pytorch_lightning.utilities.rank_zero][INFO] - GPU available: True, used: True
+[2022-04-19 15:45:43,331][pytorch_lightning.utilities.rank_zero][INFO] - TPU available: False, using: 0 TPU cores
+[2022-04-19 15:45:43,331][pytorch_lightning.utilities.rank_zero][INFO] - IPU available: False, using: 0 IPUs
+[2022-04-19 15:45:43,331][pytorch_lightning.utilities.rank_zero][INFO] - HPU available: False, using: 0 HPUs
+[2022-04-19 15:45:43,332][__main__][INFO] - trainer - <pytorch_lightning.trainer.trainer.Trainer object at 0x7fa35be5af40>
+[2022-04-19 15:45:43,332][__main__][INFO] - type - <class 'pytorch_lightning.trainer.trainer.Trainer'>
+[2022-04-19 15:45:43,332][__main__][INFO] - bye
+#+end_src
+
+Note that ~hydra~ sets up some logging configuration by default, see [[https://hydra.cc/docs/tutorials/basic/running_your_app/logging/][documentation]]. 
+
+** Defining models
+
+We want to avoid redefining the same configuration for all our models
+separately. We can do this using a "base" setup for ~segmentation~. In
+~conf/models/base/segmentation.yaml~ we define some defaults, that we can then
+override or add to in the specific model files.
+
+#+begin_src yaml :tangle conf/model/base/segmentation.yaml
+# @package @_global_
+
+model:
+  name: segmentation
+  batch_size: 12
+data:
+  train:
+    path: ${base}/${.dataset}/dataset.jsonlines
+#+end_src
+
+A model that uses this can override variables and introduce new ones as well.
+
+#+begin_src yaml :tangle conf/model/ils-roof-materials.yaml
+# @package @_global_
+
+defaults:
+  - base: segmentation
+  - _self_
+
+model:
+  batch_size: 2  # this overrides what is in the base configuration
+  new_variable: super
+data:
+  train:
+    dataset: "ils-roof-materials/train"
+#+end_src
+
+Another model definition, easily expanding the ~segmentation~ model.
+
+#+begin_src yaml :tangle conf/model/ils-streetview-materials.yaml
+# @package @_global_
+
+defaults:
+  - base: segmentation
+  - _self_
+data:
+  train:
+    dataset: "ils-streetview-materials/train"
+  test:
+    dataset: "ils-streetview-materials/test"
+#+end_src
+
+** Accessing the configuration
+
+In this simple script the resolved (default) configuration is shown. 
+
+#+begin_src python :tangle defaults.py
+  import hydra
+  import json
+  from omegaconf import DictConfig, OmegaConf
+
+  @hydra.main(config_path="conf", config_name="train")
+  def main(cfg : DictConfig) -> None:
+    print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+    message = cfg.message
+    print(f"{message=}")
+
+  if __name__ == "__main__":
+      main()
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src python
+ {
+   "model": {
+     "name": "segmentation",
+     "batch_size": 2,
+     "new_variable": "super"
+   },
+   "data": {
+     "train": {
+       "path": "./data/ils-roof-materials/train/dataset.jsonlines",
+       "dataset": "ils-roof-materials/train"
+     }
+   },
+   "trainer": {
+     "_target_": "pytorch_lightning.Trainer",
+     "accelerator": "gpu",
+     "max_epochs": 1
+   },
+   "base": "./data",
+   "message": "hello at ./data"
+ }
+ message='hello at ./data'
+ #+end_src
+
+** Trying out multiple parameters quickly
+
+Using ~--multirun~ you can quickly start multiple scripts. These scripts all get
+their own version of the configuration.
+
+#+begin_src bash
+python -m defaults --multirun model=ils-roof-materials +model.input_size=2,3,4
+#+end_src
+
+#+RESULTS:
+#+begin_src bash
+[2022-04-19 15:08:30,404][HYDRA] Launching 3 jobs locally
+0 : model=ils-roof-materials +model.input_size=2
+{'model': {'name': 'segmentation', 'batch_size': 2, 'input_size': 2}, 'data': {'train': {'path': './data/ils-roof-materials/train/dataset.jsonlines', 'dataset': 'ils-roof-materials/train'}}, 'trainer': {'_target_': 'pytorch_lightning.Trainer'}, 'base': './data', 'name': 'hello at ./data'}
+1 : model=ils-roof-materials +model.input_size=3
+{'model': {'name': 'segmentation', 'batch_size': 2, 'input_size': 3}, 'data': {'train': {'path': './data/ils-roof-materials/train/dataset.jsonlines', 'dataset': 'ils-roof-materials/train'}}, 'trainer': {'_target_': 'pytorch_lightning.Trainer'}, 'base': './data', 'name': 'hello at ./data'}
+2 : model=ils-roof-materials +model.input_size=4
+{'model': {'name': 'segmentation', 'batch_size': 2, 'input_size': 4}, 'data': {'train': {'path': './data/ils-roof-materials/train/dataset.jsonlines', 'dataset': 'ils-roof-materials/train'}}, 'trainer': {'_target_': 'pytorch_lightning.Trainer'}, 'base': './data', 'name': 'hello at ./data'}
+#+end_src
+
+** Defining an experiment
+
+If you want to define an experiment, but you don't want to change one of the
+model files, you can save them separately to the ~experiments~ folder. Here are
+two ideas that we may want to try out. They can now be combined with all models
+as well.
+
+#+begin_src yaml :tangle conf/experiment/biggpu.yaml
+# @package @_global_
+
+trainer:
+  gpu_size: ultra
+#+end_src
+
+#+begin_src yaml :tangle conf/experiment/cropbigbatch.yaml
+# @package @_global_
+model:
+  batch_size: 14
+data:
+  train:
+    set:
+      augment:
+        cfg: ubercrop
+  test:
+    set:
+      augment:
+        cfg: ubercrop
+    
+#+end_src
+
+This final example shows how we try out both experiments for both models,
+resulting in 4 runs. These "jobs" are launched locally but in our setup, the
+script will actually set up a cloud run so this will start 4 AWS batch jobs. 
+
+#+begin_src bash
+python -m defaults --multirun model=ils-roof-materials,ils-streetview-materials +experiment=biggpu,cropbigbatch
+#+end_src
+
+#+RESULTS:
+#+begin_src bash
+[2022-04-19 16:10:51,431][HYDRA] Launching 4 jobs locally
+0 : model=ils-roof-materials +experiment=biggpu
+{
+  "model": {
+    "name": "segmentation",
+    "batch_size": 2,
+    "new_variable": "super"
+  },
+  "data": {
+    "train": {
+      "path": "./data/ils-roof-materials/train/dataset.jsonlines",
+      "dataset": "ils-roof-materials/train"
+    }
+  },
+  "trainer": {
+    "_target_": "pytorch_lightning.Trainer",
+    "accelerator": "gpu",
+    "max_epochs": 1,
+    "gpu_size": "ultra"
+  },
+  "base": "./data",
+  "message": "hello at ./data"
+}
+message='hello at ./data'
+1 : model=ils-roof-materials +experiment=cropbigbatch
+{
+  "model": {
+    "name": "segmentation",
+    "batch_size": 14,
+    "new_variable": "super"
+  },
+  "data": {
+    "train": {
+      "path": "./data/ils-roof-materials/train/dataset.jsonlines",
+      "dataset": "ils-roof-materials/train",
+      "set": {
+        "augment": {
+          "cfg": "ubercrop"
+        }
+      }
+    },
+    "test": {
+      "set": {
+        "augment": {
+          "cfg": "ubercrop"
+        }
+      }
+    }
+  },
+  "trainer": {
+    "_target_": "pytorch_lightning.Trainer",
+    "accelerator": "gpu",
+    "max_epochs": 1
+  },
+  "base": "./data",
+  "message": "hello at ./data"
+}
+message='hello at ./data'
+2 : model=ils-streetview-materials +experiment=biggpu
+{
+  "model": {
+    "name": "segmentation",
+    "batch_size": 12
+  },
+  "data": {
+    "train": {
+      "path": "./data/ils-streetview-materials/train/dataset.jsonlines",
+      "dataset": "ils-streetview-materials/train"
+    },
+    "test": {
+      "dataset": "ils-streetview-materials/test"
+    }
+  },
+  "trainer": {
+    "_target_": "pytorch_lightning.Trainer",
+    "accelerator": "gpu",
+    "max_epochs": 1,
+    "gpu_size": "ultra"
+  },
+  "base": "./data",
+  "message": "hello at ./data"
+}
+message='hello at ./data'
+3 : model=ils-streetview-materials +experiment=cropbigbatch
+{
+  "model": {
+    "name": "segmentation",
+    "batch_size": 14
+  },
+  "data": {
+    "train": {
+      "path": "./data/ils-streetview-materials/train/dataset.jsonlines",
+      "dataset": "ils-streetview-materials/train",
+      "set": {
+        "augment": {
+          "cfg": "ubercrop"
+        }
+      }
+    },
+    "test": {
+      "dataset": "ils-streetview-materials/test",
+      "set": {
+        "augment": {
+          "cfg": "ubercrop"
+        }
+      }
+    }
+  },
+  "trainer": {
+    "_target_": "pytorch_lightning.Trainer",
+    "accelerator": "gpu",
+    "max_epochs": 1
+  },
+  "base": "./data",
+  "message": "hello at ./data"
+}
+message='hello at ./data'
+#+end_src
